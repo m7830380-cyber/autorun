@@ -458,6 +458,9 @@ struct horizon_fd_message
 {
     int fd;
     unsigned int handle;
+    /* The request pipe of the thread the fd is for: threads pass fds at the
+     * same time, and one queue in arrival order handed a thread another's. */
+    const void *owner;
     struct horizon_fd_message *next;
 };
 
@@ -4683,7 +4686,8 @@ int horizon_poll_pipe_write( int fd, size_t size, int timeout )
     return horizon_poll_pipe( &pfd, timeout, size );
 }
 
-static void horizon_fd_queue_push( struct horizon_fd_queue *queue, int fd, unsigned int handle )
+static void horizon_fd_queue_push( struct horizon_fd_queue *queue, int fd, unsigned int handle,
+                                   const void *owner )
 {
     struct horizon_fd_message *message = malloc( sizeof(*message) );
 
@@ -4696,17 +4700,19 @@ static void horizon_fd_queue_push( struct horizon_fd_queue *queue, int fd, unsig
 
     message->fd = fd;
     message->handle = handle;
+    message->owner = owner;
     message->next = NULL;
 
     pthread_mutex_lock( &queue->mutex );
     if (queue->tail) queue->tail->next = message;
     else queue->head = message;
     queue->tail = message;
-    pthread_cond_signal( &queue->cond );
+    pthread_cond_broadcast( &queue->cond );
     pthread_mutex_unlock( &queue->mutex );
 }
 
-static void horizon_fd_queue_push_dup( struct horizon_fd_queue *queue, int fd, unsigned int handle )
+static void horizon_fd_queue_push_dup( struct horizon_fd_queue *queue, int fd, unsigned int handle,
+                                       const void *owner )
 {
     int passed_fd = dup( fd );
 
@@ -4716,21 +4722,39 @@ static void horizon_fd_queue_push_dup( struct horizon_fd_queue *queue, int fd, u
         exit(1);
     }
 
-    horizon_fd_queue_push( queue, passed_fd, handle );
+    horizon_fd_queue_push( queue, passed_fd, handle, owner );
 }
 
-static int horizon_fd_queue_pop( struct horizon_fd_queue *queue, unsigned int *handle )
+/* The oldest fd for owner, else the oldest nobody's (sent before the thread
+ * had a request pipe); a NULL owner takes the oldest of any. */
+static struct horizon_fd_message **horizon_fd_queue_find( struct horizon_fd_queue *queue, const void *owner )
 {
-    struct horizon_fd_message *message;
+    struct horizon_fd_message **link, **unowned = NULL;
+
+    for (link = &queue->head; *link; link = &(*link)->next)
+    {
+        if (!owner || (*link)->owner == owner) return link;
+        if (!(*link)->owner && !unowned) unowned = link;
+    }
+    return unowned;
+}
+
+static int horizon_fd_queue_pop( struct horizon_fd_queue *queue, unsigned int *handle, const void *owner )
+{
+    struct horizon_fd_message *message, **link, *prev;
     int fd;
 
     pthread_mutex_lock( &queue->mutex );
-    while (!queue->head)
+    while (!(link = horizon_fd_queue_find( queue, owner )))
         horizon_cond_wait_quit( &queue->cond, &queue->mutex );
 
-    message = queue->head;
-    queue->head = message->next;
-    if (!queue->head) queue->tail = NULL;
+    message = *link;
+    *link = message->next;
+    if (queue->tail == message)
+    {
+        for (prev = queue->head; prev && prev->next; prev = prev->next) ;
+        queue->tail = prev;
+    }
     pthread_mutex_unlock( &queue->mutex );
 
     fd = message->fd;
@@ -4739,14 +4763,32 @@ static int horizon_fd_queue_pop( struct horizon_fd_queue *queue, unsigned int *h
     return fd;
 }
 
+static const void *horizon_current_client_pipe( void )
+{
+    /* Unset until server_init_thread: then only the bootstrap passes fds. */
+    struct thread_data *data = get_thread_data();
+
+    return data ? horizon_pipe_from_fd( data->request_fd ) : NULL;
+}
+
 void horizon_server_queue_fd( int fd, unsigned int handle )
 {
-    horizon_fd_queue_push_dup( &horizon_server_to_client_fds, fd, handle );
+    struct horizon_server_connection *current = horizon_server_current;
+
+    horizon_fd_queue_push_dup( &horizon_server_to_client_fds, fd, handle,
+                               current ? current->request_pipe : NULL );
+}
+
+static int horizon_server_take_connection_fd( struct horizon_server_connection *connection,
+                                              unsigned int *handle )
+{
+    return horizon_fd_queue_pop( &horizon_client_to_server_fds, handle,
+                                 connection ? connection->request_pipe : NULL );
 }
 
 int horizon_server_take_client_fd( unsigned int *handle )
 {
-    return horizon_fd_queue_pop( &horizon_client_to_server_fds, handle );
+    return horizon_fd_queue_pop( &horizon_client_to_server_fds, handle, NULL );
 }
 
 static int horizon_read_exact( int fd, void *buffer, size_t size )
@@ -7003,8 +7045,8 @@ static int horizon_server_handle_init_first_thread( struct horizon_server_connec
     unsigned int handle;
     int reply_fd, wait_fd;
 
-    reply_fd = horizon_server_take_client_fd( &handle );
-    wait_fd = horizon_server_take_client_fd( &handle );
+    reply_fd = horizon_server_take_connection_fd( connection, &handle );
+    wait_fd = horizon_server_take_connection_fd( connection, &handle );
     connection->reply_fd = reply_fd;
     connection->wait_fd = wait_fd;
 
@@ -7065,8 +7107,8 @@ static int horizon_server_handle_init_thread( struct horizon_server_connection *
     unsigned int handle;
     int reply_fd, wait_fd;
 
-    reply_fd = horizon_server_take_client_fd( &handle );
-    wait_fd = horizon_server_take_client_fd( &handle );
+    reply_fd = horizon_server_take_connection_fd( connection, &handle );
+    wait_fd = horizon_server_take_connection_fd( connection, &handle );
 
     if (connection->reply_fd != -1) close( connection->reply_fd );
     if (connection->wait_fd != -1) close( connection->wait_fd );
@@ -11931,7 +11973,7 @@ static int horizon_server_handle_new_thread( struct horizon_server_connection *c
     struct horizon_server_object *object = NULL;
     unsigned int fd_handle;
     pthread_t thread;
-    int request_fd = horizon_server_take_client_fd( &fd_handle );
+    int request_fd = horizon_server_take_connection_fd( connection, &fd_handle );
 
     /* Connection threads are joined here and when another connection ends. */
     horizon_zombie_reap( &horizon_server_zombies );
@@ -17535,12 +17577,12 @@ int horizon_server_connect(void)
 
 void horizon_server_send_fd( int fd )
 {
-    horizon_fd_queue_push_dup( &horizon_client_to_server_fds, fd, 0 );
+    horizon_fd_queue_push_dup( &horizon_client_to_server_fds, fd, 0, horizon_current_client_pipe() );
 }
 
 int horizon_server_receive_fd( unsigned int *handle )
 {
-    return horizon_fd_queue_pop( &horizon_server_to_client_fds, handle );
+    return horizon_fd_queue_pop( &horizon_server_to_client_fds, handle, horizon_current_client_pipe() );
 }
 
 #ifndef HORIZON_NO_LIBNX_EXCEPTION_HANDLER
