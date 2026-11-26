@@ -36,6 +36,8 @@ extern void wine_nx_thread_set_name( unsigned int tid, const char *name ) __attr
 extern void wine_nx_thread_set_affinity( unsigned int tid, unsigned int mask ) __attribute__((weak));
 extern __thread int horizon_suspend_pending;
 extern void horizon_wait_suspend_arm64ec(void);
+struct context_data;
+extern void horizon_capture_wait_contexts( struct context_data server_contexts[2] ) __attribute__((weak));
 extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
 extern void horizon_get_address_space_limits( void **start, void **limit );
 extern void *virtual_alloc_horizon_native( size_t size, void **token );

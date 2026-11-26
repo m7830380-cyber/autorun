@@ -1681,6 +1681,20 @@ void wait_suspend( CONTEXT *context )
     errno = saved_errno;
 }
 
+#if defined(__SWITCH__) && defined(__aarch64__)
+void horizon_capture_wait_contexts( struct context_data server_contexts[2] )
+{
+    CONTEXT context = { .ContextFlags = CONTEXT_ARM64_FULL };
+
+    if (!get_thread_data()->teb || NtGetContextThread( GetCurrentThread(), &context ))
+    {
+        memset( server_contexts, 0, 2 * sizeof(*server_contexts) );
+        return;
+    }
+    contexts_to_server( server_contexts, &context );
+}
+#endif
+
 
 #ifdef __APPLE__
 /**********************************************************************

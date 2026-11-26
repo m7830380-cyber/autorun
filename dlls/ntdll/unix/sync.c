@@ -2508,7 +2508,7 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
 #ifdef __SWITCH__
-        for (;;) svcSleepThread( 1000000000LL );
+        return server_wait( NULL, 0, SELECT_INTERRUPTIBLE, NULL );
 #else
         for (;;) select( 0, NULL, NULL, NULL, NULL );
 #endif

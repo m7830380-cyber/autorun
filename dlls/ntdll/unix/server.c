@@ -890,7 +890,9 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
                 {
                     data_size_t ctx_size = (context[1].machine ? 2 : 1) * sizeof(*context);
                     wine_server_add_data( req, context, ctx_size );
+#ifndef __SWITCH__
                     suspend_context = FALSE; /* server owns the context now */
+#endif
                 }
                 wine_server_set_reply( req, &reply_data,
                                        context ? sizeof(reply_data) : sizeof(reply_data.call) );
@@ -944,7 +946,21 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         abs_timeout -= now.QuadPart;
     }
 
+#if defined(__SWITCH__) && defined(__aarch64__)
+    {
+        struct context_data server_contexts[2];
+        struct context_data *wait_context = NULL;
+
+        if (&horizon_capture_wait_contexts)
+        {
+            horizon_capture_wait_contexts( server_contexts );
+            if (server_contexts[0].machine) wait_context = server_contexts;
+        }
+        ret = server_select( select_op, size, flags, abs_timeout, wait_context, &apc );
+    }
+#else
     ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+#endif
     if (ret == STATUS_USER_APC) return invoke_user_apc( NULL, &apc, ret );
 
     /* A test on Windows 2000 shows that Windows always yields during
