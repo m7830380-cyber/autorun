@@ -516,7 +516,7 @@ DEFINE_SYSCALL(NtQueryLicenseValue, (const UNICODE_STRING *name, ULONG *type, vo
 DEFINE_SYSCALL(NtQueryMultipleValueKey, (HANDLE key, KEY_MULTIPLE_VALUE_INFORMATION *info, ULONG count, void *buffer, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQueryMutant, (HANDLE handle, MUTANT_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
 DEFINE_SYSCALL(NtQueryObject, (HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len))
-DEFINE_SYSCALL(NtQueryPerformanceCounter, (LARGE_INTEGER *counter, LARGE_INTEGER *frequency))
+DEFINE_WRAPPED_SYSCALL(NtQueryPerformanceCounter, (LARGE_INTEGER *counter, LARGE_INTEGER *frequency))
 DEFINE_SYSCALL(NtQuerySection, (HANDLE handle, SECTION_INFORMATION_CLASS class, void *ptr, SIZE_T size, SIZE_T *ret_size))
 DEFINE_SYSCALL(NtQuerySecurityObject, (HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR descr, ULONG length, ULONG *retlen))
 DEFINE_SYSCALL(NtQuerySemaphore, (HANDLE handle, SEMAPHORE_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
@@ -525,7 +525,7 @@ DEFINE_SYSCALL(NtQuerySystemEnvironmentValue, (UNICODE_STRING *name, WCHAR *buff
 DEFINE_SYSCALL(NtQuerySystemEnvironmentValueEx, (UNICODE_STRING *name, GUID *vendor, void *buffer, ULONG *retlen, ULONG *attrib))
 DEFINE_WRAPPED_SYSCALL(NtQuerySystemInformation, (SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size))
 DEFINE_SYSCALL(NtQuerySystemInformationEx, (SYSTEM_INFORMATION_CLASS class, void *query, ULONG query_len, void *info, ULONG size, ULONG *ret_size))
-DEFINE_SYSCALL(NtQuerySystemTime, (LARGE_INTEGER *time))
+DEFINE_WRAPPED_SYSCALL(NtQuerySystemTime, (LARGE_INTEGER *time))
 DEFINE_SYSCALL(NtQueryTimer, (HANDLE handle, TIMER_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
 DEFINE_SYSCALL(NtQueryTimerResolution, (ULONG *min_res, ULONG *max_res, ULONG *current_res))
 DEFINE_SYSCALL(NtQueryValueKey, (HANDLE handle, const UNICODE_STRING *name, KEY_VALUE_INFORMATION_CLASS info_class, void *info, DWORD length, DWORD *result_len))
@@ -798,6 +798,41 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
 
     leave_syscall_callback();
     return status;
+}
+
+/* Games ask for the time hundreds of thousands of times a second (Unity's
+ * main loop and job system), and each syscall is a trip through the unix side.
+ * Read the clock here instead: the generic timer counts in user mode, and the
+ * unix side's counter is the same timer in 100 ns units, so both agree. */
+NTSTATUS SYSCALL_API NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency )
+{
+    ULONG64 ticks, freq;
+
+    __asm__ __volatile__( "mrs %0, cntfrq_el0" : "=r" (freq) );
+    if (!freq) return syscall_NtQueryPerformanceCounter( counter, frequency );
+    __asm__ __volatile__( "isb; mrs %0, cntpct_el0" : "=r" (ticks) :: "memory" );
+    counter->QuadPart = (ticks / freq) * 10000000 + (ticks % freq) * 10000000 / freq;
+    if (frequency) frequency->QuadPart = 10000000;
+    return STATUS_SUCCESS;
+}
+
+/* GetSystemTimeAsFileTime: KUSER_SHARED_DATA's SystemTime, kept current by
+ * the unix side's shared data clock, as Windows reads it. */
+NTSTATUS SYSCALL_API NtQuerySystemTime( LARGE_INTEGER *time )
+{
+    KSYSTEM_TIME *st = (KSYSTEM_TIME *)&user_shared_data->SystemTime;
+    LONG high;
+    ULONG low;
+
+    do
+    {
+        high = __atomic_load_n( &st->High1Time, __ATOMIC_ACQUIRE );
+        low = __atomic_load_n( &st->LowPart, __ATOMIC_ACQUIRE );
+    }
+    while (high != __atomic_load_n( &st->High2Time, __ATOMIC_ACQUIRE ));
+    if (!high) return syscall_NtQuerySystemTime( time );
+    time->QuadPart = (ULONG64)(ULONG)high << 32 | low;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS SYSCALL_API NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size )
