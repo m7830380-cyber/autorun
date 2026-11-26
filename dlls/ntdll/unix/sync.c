@@ -3706,7 +3706,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         int ret;
 #if defined(__SWITCH__) && defined(__aarch64__)
         struct context_data park_contexts[2];
-        int parked = 0;
+        int parked = 0, grace_done = 0;
 #endif
 
         if (timeout)
@@ -3720,6 +3720,29 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         while (!InterlockedExchange( futex, 0 ))
         {
 #if defined(__SWITCH__) && defined(__aarch64__)
+            /* Parking takes the server's busiest lock twice, and Unity hands
+             * its locks back and forth thousands of times a second, mostly
+             * waking within a millisecond. Sleep that long unparked first: a
+             * suspender polls until the thread parks, so it waits at most this
+             * grace period longer. */
+            if (!parked && !grace_done)
+            {
+                struct timespec grace = { 0, 1000000 };
+
+                grace_done = 1;
+                if (timeout)
+                {
+                    LONGLONG timeleft = update_timeout( end );
+                    if (timeleft < 10000) grace.tv_nsec = timeleft * 100;
+                }
+                ret = futex_wait( futex, 0, &grace );
+                if (ret == -1 && errno == ETIMEDOUT && timeout && !update_timeout( end ))
+                {
+                    status = STATUS_TIMEOUT;
+                    break;
+                }
+                continue;
+            }
             /* The futex never reaches the server, so a suspender reading this
              * thread's registers (the Mono GC stopping the world) would wait
              * forever for a server call: publish them before blocking. */
