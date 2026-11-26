@@ -4814,7 +4814,8 @@ static int horizon_server_write_reply( int fd, const void *reply, size_t reply_s
         memcpy( current->inline_reply, reply, reply_size );
         if (data_size > current->inline_size) data_size = current->inline_size;
         if (data_size) memcpy( current->inline_data, data, data_size );
-        current->inline_replied = 1;
+        /* 1 + the bytes of data: the caller copies them out after the request. */
+        current->inline_replied = 1 + (int)data_size;
         return 0;
     }
 
@@ -17277,11 +17278,16 @@ static int horizon_server_dispatch( struct horizon_server_connection *connection
 int horizon_server_inline_call( int request_fd, const void *message, const void *data,
                                 unsigned int data_size, void *reply, void *reply_data )
 {
+    static unsigned int no_reply_count, nested_count;
     struct horizon_pipe *pipe = horizon_pipe_from_fd( request_fd );
     struct horizon_server_connection *connection, *previous;
     unsigned char request[HORIZON_SERVER_FIXED_MESSAGE_SIZE];
+    union { unsigned long long align; unsigned char bytes[HORIZON_SERVER_FIXED_MESSAGE_SIZE]; } reply_buf;
     struct horizon_server_request_header *header = (void *)request;
-    unsigned char *request_data = NULL;
+    unsigned char *request_data = NULL, *reply_scratch = NULL;
+    void *saved_reply, *saved_data;
+    size_t saved_size, reply_size;
+    int saved_replied, replied;
 
     if (!pipe || !(connection = __atomic_load_n( &pipe->inline_connection, __ATOMIC_ACQUIRE ))) return 0;
     {
@@ -17299,26 +17305,67 @@ int horizon_server_inline_call( int request_fd, const void *message, const void 
         return 1;
     }
     if (data_size) memcpy( request_data, data, data_size );
+    /* The reply goes to buffers of our own and reaches the caller's memory only
+     * after the server code returned and let go of its locks, as a pipe read
+     * did: a fault on the caller's buffer (a write-watched page) under
+     * horizon_server_objects_mutex waits for the virtual lock, whose holder
+     * may be waiting for that mutex. */
+    reply_size = reply_data ? header->reply_size : 0;
+    if (reply_size && !(reply_scratch = malloc( reply_size )))
+    {
+        free( request_data );
+        ((struct horizon_server_reply_header *)reply)->error = HORIZON_STATUS_NO_MEMORY;
+        return 1;
+    }
 
-    connection->inline_reply = reply;
-    connection->inline_data = reply_data;
-    connection->inline_size = reply_data ? header->reply_size : 0;
+    /* A request while one runs on this thread (from a fault handler, say)
+     * keeps the outer request's buffers for it. */
+    saved_reply = connection->inline_reply;
+    saved_data = connection->inline_data;
+    saved_size = connection->inline_size;
+    saved_replied = connection->inline_replied;
+    if (saved_reply && __atomic_fetch_add( &nested_count, 1, __ATOMIC_RELAXED ) < 8)
+    {
+        char line[128];
+
+        snprintf( line, sizeof(line), "[INLINE] request %u inside request on tid %04x",
+                  header->req, connection->tid );
+        wine_nx_runtime_trace( line );
+    }
+    memset( &reply_buf, 0, sizeof(reply_buf) );
+    connection->inline_reply = reply_buf.bytes;
+    connection->inline_data = reply_scratch;
+    connection->inline_size = reply_size;
     connection->inline_replied = 0;
     previous = horizon_server_current;
     horizon_server_current = connection;
     horizon_server_dispatch( connection, request, request_data );
     horizon_server_current = previous;
-    connection->inline_reply = NULL;
-    connection->inline_data = NULL;
-    connection->inline_size = 0;
+    replied = connection->inline_replied;
+    connection->inline_reply = saved_reply;
+    connection->inline_data = saved_data;
+    connection->inline_size = saved_size;
+    connection->inline_replied = saved_replied;
     free( request_data );
 
-    if (!connection->inline_replied)
+    if (replied)
     {
-        WARN( "inline Horizon server request %d wrote no reply.\n", header->req );
-        memset( reply, 0, HORIZON_SERVER_FIXED_MESSAGE_SIZE );
+        memcpy( reply, reply_buf.bytes, HORIZON_SERVER_FIXED_MESSAGE_SIZE );
+        if (replied > 1) memcpy( reply_data, reply_scratch, replied - 1 );
+    }
+    else
+    {
+        if (__atomic_fetch_add( &no_reply_count, 1, __ATOMIC_RELAXED ) < 16)
+        {
+            char line[128];
+
+            snprintf( line, sizeof(line), "[INLINE] request %u on tid %04x wrote no reply",
+                      header->req, connection->tid );
+            wine_nx_runtime_trace( line );
+        }
         ((struct horizon_server_reply_header *)reply)->error = HORIZON_STATUS_UNSUCCESSFUL;
     }
+    free( reply_scratch );
     return 1;
 }
 

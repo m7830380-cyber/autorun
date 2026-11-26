@@ -480,8 +480,9 @@ static void stall_watch( void *arg )
         else quiet++;
         last_frames = frames;
         /* Ten seconds without a frame. A game loading a level does that too, so
-         * this says its piece three times and then leaves the log alone. */
-        if (quiet >= 2 && reported < 3)
+         * this says its piece three times, then once a minute (the launcher's
+         * wait spent the three before a game started), up to ten more. */
+        if ((quiet >= 2 && reported < 3) || (quiet % 12 == 0 && quiet && reported < 13))
         {
             log_line( "[STALL] no frame drawn for %u s; where the threads are standing", quiet * 5 );
             wine_nx_threads_report_stalled();
