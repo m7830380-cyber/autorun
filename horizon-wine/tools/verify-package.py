@@ -10,7 +10,9 @@ first and then there, which is how the two meet on a card."""
 from pathlib import Path
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 
 root = Path(__file__).resolve().parents[2]
@@ -19,7 +21,19 @@ parser.add_argument("stage", type=Path)
 parser.add_argument("--dlls", type=Path, default=root / "horizon-dlls/switch/wine")
 args = parser.parse_args()
 stage, dlls = args.stage.resolve(), args.dlls.resolve()
-readobj = root / "horizon-wine/toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin/llvm-readobj"
+
+def find_readobj():
+    env = os.environ.get("WINE_NX_LLVM_MINGW")
+    if env:
+        candidate = Path(env) / "bin/llvm-readobj"
+        if candidate.is_file():
+            return candidate
+    found = shutil.which("llvm-readobj")
+    if found:
+        return Path(found)
+    return root / "horizon-wine/toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin/llvm-readobj"
+
+readobj = find_readobj()
 
 def inspect(path, option):
     return subprocess.check_output([str(readobj), option, str(path)], text=True)

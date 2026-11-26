@@ -1,0 +1,33 @@
+name: Build Autorun (AMD64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build-amd64
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex xz-utils
+
+      - name: Build Autorun AMD64 package
+        run: |
+          sh build.sh
+          ls -lh horizon-wine/build-autorun/
+
+      - name: Upload Autorun package
+        uses: actions/upload-artifact@v4
+        with:
+          name: autorun-amd64
+          path: horizon-wine/build-autorun/autorun-*.zip
+          if-no-files-found: error
