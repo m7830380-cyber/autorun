@@ -4631,11 +4631,11 @@ UINT_PTR get_host_page_size(void)
 void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
 {
 #if defined(__SWITCH__)
-    unsigned long long total, used;
+    unsigned long long total;
 
-    /* newlib's sysconf has no _SC_PHYS_PAGES value: GlobalMemoryStatusEx saw 0 MB. */
-    horizon_get_memory_info( &total, &used );
-    (void)used;
+    /* newlib's sysconf has no _SC_PHYS_PAGES value: GlobalMemoryStatusEx saw 0 MB.
+     * Only the total: what is free would walk the heap under malloc's lock. */
+    horizon_get_memory_info( &total, NULL );
     info->MmHighestPhysicalPage = max( 2, total / page_size );
 #elif defined(HAVE_SYSINFO) \
     && defined(HAVE_STRUCT_SYSINFO_TOTALRAM) && defined(HAVE_STRUCT_SYSINFO_MEM_UNIT)

@@ -3983,11 +3983,14 @@ unsigned int horizon_get_processor_count(void)
 void horizon_get_memory_info( unsigned long long *total, unsigned long long *used )
 {
     extern char *fake_heap_start, *fake_heap_end;
-    unsigned long long heap_size, heap_free;
+    static unsigned long long cached_free, cached_tick;
+    unsigned long long heap_size, heap_free, last;
     struct mallinfo heap;
-    u64 value;
+    u64 value, now;
 
     *total = R_SUCCEEDED( svcGetInfo( &value, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
+    /* GetSystemInfo asks only for the total (SystemBasicInformation). */
+    if (!used) return;
     *used = R_SUCCEEDED( svcGetInfo( &value, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0 ) ) ? value : 0;
     if (*used > *total) *used = *total;
 
@@ -3998,10 +4001,23 @@ void horizon_get_memory_info( unsigned long long *total, unsigned long long *use
      * runtime prints as heap_free_mb. Without this, GlobalMemoryStatusEx
      * reported 4 MB of AvailPageFile and Fallout New Vegas, which wants 512 MB,
      * quit with "Not enough memory to run application." */
-    heap = mallinfo();
+    /* mallinfo walks every free chunk of a heap of more than a gigabyte, holding
+     * malloc's only lock while it does, and Unity and Mono ask for memory status
+     * over and over: every other thread's malloc waited. A quarter second old
+     * answer is as good to them. */
     heap_size = fake_heap_end > fake_heap_start ? (unsigned long long)(fake_heap_end - fake_heap_start) : 0;
-    heap_free = (unsigned long long)heap.fordblks +
-                (heap_size > (unsigned long long)heap.arena ? heap_size - (unsigned long long)heap.arena : 0);
+    now = armGetSystemTick();
+    last = __atomic_load_n( &cached_tick, __ATOMIC_ACQUIRE );
+    if (last && now - last < armNsToTicks( 250000000 ))
+        heap_free = __atomic_load_n( &cached_free, __ATOMIC_RELAXED );
+    else
+    {
+        heap = mallinfo();
+        heap_free = (unsigned long long)heap.fordblks +
+                    (heap_size > (unsigned long long)heap.arena ? heap_size - (unsigned long long)heap.arena : 0);
+        __atomic_store_n( &cached_free, heap_free, __ATOMIC_RELAXED );
+        __atomic_store_n( &cached_tick, now ? now : 1, __ATOMIC_RELEASE );
+    }
     /* mallinfo's fields are narrower than the heap on a 32-bit address space,
      * so bound the result by the heap and by what Horizon reports. */
     if (heap_free > heap_size) heap_free = heap_size;
@@ -12084,6 +12100,8 @@ static int horizon_server_handle_suspend_thread( struct horizon_server_connectio
     if ((object = horizon_server_get_thread_locked( request->handle, &status )))
     {
         status = horizon_thread_suspend( &object->thread, &reply.count );
+        /* Seen before parked is next read: horizon_thread_park pairs with this. */
+        __atomic_thread_fence( __ATOMIC_SEQ_CST );
 #ifndef HORIZON_STANDALONE_SYNTAX
         if (!status && object->thread.started && !reply.count)
             horizon_server_set_suspend_doorbell_locked( object, 1 );
@@ -12156,7 +12174,9 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
             const struct context_data *contexts;
             unsigned int count;
 
-            while (!object->thread_context_valid && !object->parked && object->thread.suspend &&
+            /* parked is published without the object lock (horizon_thread_park). */
+            while (!object->thread_context_valid && !__atomic_load_n( &object->parked, __ATOMIC_SEQ_CST ) &&
+                   object->thread.suspend &&
                    !object->thread.terminated)
             {
                 horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
@@ -12216,8 +12236,8 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
             else if (!object->thread.started) status = HORIZON_STATUS_NOT_SUPPORTED;
             else
             {
-                while (!object->thread_context_valid && !object->parked && object->thread.suspend &&
-                       !object->thread.terminated)
+                while (!object->thread_context_valid && !__atomic_load_n( &object->parked, __ATOMIC_SEQ_CST ) &&
+                       object->thread.suspend && !object->thread.terminated)
                 {
                     horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
                     horizon_server_quit_check_locked();
@@ -12249,8 +12269,46 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
  * then waits in the server before it runs Windows code again. */
 int horizon_thread_park( unsigned int tid, const struct context_data *contexts, int park )
 {
-    struct horizon_server_object *thread;
+    struct horizon_server_object *thread = horizon_sync_thread;
     int suspended = 0;
+
+    /* Every blocking Windows lock wait parks and unparks, and the object lock
+     * is the server's busiest: Unity's main thread spent an eighth of its time
+     * queued for it here. The thread's own object, held by the sync cache's
+     * reference, is published to without the lock. A suspender sets suspend
+     * before it reads parked, and this thread sets parked before it reads
+     * suspend, so one of them always sees the other. */
+    if (!thread || thread->thread.tid != tid)
+    {
+        pthread_once( &horizon_sync_thread_once, horizon_sync_init_thread_key );
+        if (horizon_sync_thread_key_valid)
+        {
+            pthread_mutex_lock( &horizon_server_objects_mutex );
+            thread = horizon_sync_get_thread_locked( tid );
+            pthread_mutex_unlock( &horizon_server_objects_mutex );
+        }
+        else thread = NULL;
+    }
+    if (thread)
+    {
+        if (__atomic_load_n( &thread->thread.terminated, __ATOMIC_ACQUIRE )) return 0;
+        if (park)
+        {
+            memcpy( thread->park_contexts, contexts, sizeof(thread->park_contexts) );
+            thread->park_context_count = contexts[1].machine ? 2 : 1;
+            __atomic_store_n( &thread->parked, 1, __ATOMIC_SEQ_CST );
+            if (__atomic_load_n( &thread->thread.suspend, __ATOMIC_SEQ_CST ))
+            {
+                pthread_mutex_lock( &horizon_server_objects_mutex );
+                horizon_server_signal_changed_locked();
+                pthread_mutex_unlock( &horizon_server_objects_mutex );
+            }
+            return 0;
+        }
+        __atomic_store_n( &thread->parked, 0, __ATOMIC_SEQ_CST );
+        return __atomic_load_n( &thread->thread.started, __ATOMIC_SEQ_CST ) &&
+               __atomic_load_n( &thread->thread.suspend, __ATOMIC_SEQ_CST );
+    }
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
     for (thread = horizon_server_threads; thread; thread = thread->thread_next)
