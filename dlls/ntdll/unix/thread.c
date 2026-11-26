@@ -1682,7 +1682,7 @@ void wait_suspend( CONTEXT *context )
 }
 
 #if defined(__SWITCH__) && defined(__aarch64__)
-void horizon_capture_wait_contexts( struct context_data server_contexts[2] )
+void horizon_capture_wait_contexts( struct context_data *server_contexts )
 {
     CONTEXT context = { .ContextFlags = CONTEXT_ARM64_FULL };
 
