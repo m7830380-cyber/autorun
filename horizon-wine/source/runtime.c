@@ -3402,6 +3402,11 @@ static void hold_thread_local_pages( void )
     tls_count = i;
     for (i = 0; i < tls_count; i++)
     {
+        /* Only a page below 4 GB can land in a 32-bit program's memory; one
+         * above it is covered by the retry in svcCreateThread, and holding it
+         * costs a slot of the 96 every program shares (each Windows thread
+         * already takes two: its own and its server connection's). */
+        if (tls_page[i] >= 0x100000000ull) continue;
         for (j = 0; j < i; j++)
             if (tls_keep[j] && tls_page[j] == tls_page[i]) break;
         if (j == i)
