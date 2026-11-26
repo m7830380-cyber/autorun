@@ -25,6 +25,22 @@ jobs:
           sh build.sh
           ls -lh horizon-wine/build-autorun/
 
+      - name: Build ntdll.dll (ARM64X)
+        run: |
+          llvm="$(ls -d "$PWD"/horizon-wine/toolchains/llvm-mingw-*-x86_64 | head -1)"
+          export PATH="$llvm/bin:$PATH"
+          make -C horizon-wine/build-wine-amd64-pe -j"$(nproc)" dlls/ntdll/aarch64-windows/ntdll.dll
+          mkdir -p horizon-wine/build-dlls
+          llvm-strip --strip-debug -o horizon-wine/build-dlls/ntdll.dll             horizon-wine/build-wine-amd64-pe/dlls/ntdll/aarch64-windows/ntdll.dll
+          ls -l horizon-wine/build-dlls/
+
+      - name: Upload ntdll.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntdll-arm64x
+          path: horizon-wine/build-dlls/ntdll.dll
+          if-no-files-found: error
+
       - name: Upload Autorun package
         uses: actions/upload-artifact@v4
         with:
