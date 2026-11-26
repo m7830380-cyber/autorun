@@ -426,6 +426,8 @@ static pthread_mutex_t mapping_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define HORIZON_PIPE_BUFFER_SIZE 0x10000
 
+struct horizon_server_connection;
+
 struct horizon_pipe
 {
     pthread_mutex_t mutex;
@@ -440,6 +442,9 @@ struct horizon_pipe
     unsigned int read_waiters;  /* threads waiting in can_read, so only they are signaled */
     unsigned int write_waiters; /* threads waiting in can_write */
     unsigned int client_cores;  /* request pipes: the cores their client thread is pinned to */
+    /* request pipes: the connection its client serves on its own thread
+     * (horizon_server_inline_call), so it needs no connection pthread */
+    struct horizon_server_connection *inline_connection;
     unsigned char buffer[HORIZON_PIPE_BUFFER_SIZE];
 };
 
@@ -3301,6 +3306,12 @@ struct horizon_server_connection
     void *direct_reply;
     void *direct_data;
     size_t direct_size;
+    /* An inline connection's reply buffers while its client runs a request,
+     * and whether the request wrote its reply. */
+    void *inline_reply;
+    void *inline_data;
+    size_t inline_size;
+    int inline_replied;
 };
 
 struct horizon_sync_waiter
@@ -3507,8 +3518,13 @@ static struct horizon_server_handle_entry *horizon_server_handle_hash[HORIZON_SE
 /* Every thread object, running or terminated, while referenced (open_thread). */
 static struct horizon_server_object *horizon_server_threads;
 static unsigned int horizon_server_running_threads;
-/* Each client connection is served by its own pthread. */
+/* The connection whose request this thread is serving: its own pthread's, or,
+ * for an inline connection, the client thread's own. */
 static __thread struct horizon_server_connection *horizon_server_current;
+/* Serve new threads' requests on the threads themselves. A connection pthread
+ * for each Windows thread spent half of the application's 96 kernel threads:
+ * Greymeat stopped at 41 Windows threads, when DXVK could start no more. */
+static int horizon_server_inline_enabled = 1;
 int horizon_fast_sync_enabled;
 static struct horizon_zombie_list horizon_server_zombies = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0 };
 struct horizon_lifecycle_counters horizon_lifecycle;
@@ -4784,11 +4800,22 @@ static int horizon_server_write_reply( int fd, const void *reply, size_t reply_s
                                        const void *data, size_t data_size )
 {
     unsigned char message[HORIZON_SERVER_FIXED_MESSAGE_SIZE] = {0};
+    struct horizon_server_connection *current = horizon_server_current;
 
     if (reply_size > sizeof(message))
     {
         errno = EOVERFLOW;
         return -1;
+    }
+
+    if (current && current->inline_reply && fd != -1 && fd == current->reply_fd)
+    {
+        memset( current->inline_reply, 0, HORIZON_SERVER_FIXED_MESSAGE_SIZE );
+        memcpy( current->inline_reply, reply, reply_size );
+        if (data_size > current->inline_size) data_size = current->inline_size;
+        if (data_size) memcpy( current->inline_data, data, data_size );
+        current->inline_replied = 1;
+        return 0;
     }
 
     memcpy( message, reply, reply_size );
@@ -11949,7 +11976,15 @@ static int horizon_server_handle_new_thread( struct horizon_server_connection *c
         return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
     }
 
-    if ((errno = pthread_create( &thread, NULL, horizon_server_thread, thread_connection )))
+    if (horizon_server_inline_enabled &&
+        (thread_connection->request_pipe = horizon_pipe_from_fd( request_fd )))
+    {
+        /* The new thread runs its requests itself (horizon_server_inline_call)
+         * until horizon_server_inline_release, when it closes its request pipe. */
+        __atomic_store_n( &thread_connection->request_pipe->inline_connection, thread_connection,
+                          __ATOMIC_RELEASE );
+    }
+    else if ((errno = pthread_create( &thread, NULL, horizon_server_thread, thread_connection )))
     {
         pthread_mutex_lock( &horizon_server_objects_mutex );
         horizon_server_end_thread_locked( thread_connection );
@@ -16671,6 +16706,646 @@ int horizon_server_sync_call( unsigned int tid, const void *message, const void 
     return 1;
 }
 
+/* One request of a client connection; its reply goes to connection->reply_fd,
+ * which horizon_server_write_reply hands straight to an inline caller. */
+static int horizon_server_dispatch( struct horizon_server_connection *connection,
+                                    unsigned char *message, unsigned char *request_data )
+{
+    struct horizon_server_request_header *header = (void *)message;
+    int status = 0;
+
+    switch (header->req)
+    {
+    case HORIZON_REQ_GET_TOKEN_SID:
+        status = horizon_server_handle_registry_user( connection, message );
+        break;
+    case HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID:
+        status = horizon_server_handle_allocate_locally_unique_id( connection );
+        break;
+    case HORIZON_REQ_CREATE_KEY:
+    case HORIZON_REQ_OPEN_KEY:
+    case HORIZON_REQ_DELETE_KEY:
+    case HORIZON_REQ_ENUM_KEY:
+    case HORIZON_REQ_SET_KEY_VALUE:
+    case HORIZON_REQ_GET_KEY_VALUE:
+    case HORIZON_REQ_ENUM_KEY_VALUE:
+    case HORIZON_REQ_DELETE_KEY_VALUE:
+    case HORIZON_REQ_SET_REGISTRY_NOTIFICATION:
+    case HORIZON_REQ_RENAME_KEY:
+        status = horizon_server_handle_registry( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_INIT_FIRST_THREAD:
+        status = horizon_server_handle_init_first_thread( connection, message );
+        break;
+    case HORIZON_REQ_INIT_PROCESS_DONE:
+        status = horizon_server_handle_init_process_done( connection, message );
+        break;
+    case HORIZON_REQ_INIT_THREAD:
+        status = horizon_server_handle_init_thread( connection, message );
+        break;
+    case HORIZON_REQ_NEW_THREAD:
+        status = horizon_server_handle_new_thread( connection, message );
+        break;
+    case HORIZON_REQ_SUSPEND_THREAD:
+        status = horizon_server_handle_suspend_thread( connection, message );
+        break;
+    case HORIZON_REQ_RESUME_THREAD:
+        status = horizon_server_handle_resume_thread( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_CONTEXT:
+        status = horizon_server_handle_get_thread_context( connection, message );
+        break;
+    case HORIZON_REQ_SET_THREAD_CONTEXT:
+        status = horizon_server_handle_set_thread_context( connection, message, request_data,
+                                                           header->request_size );
+        break;
+    case HORIZON_REQ_TERMINATE_THREAD:
+        status = horizon_server_handle_terminate_thread( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_INFO:
+        status = horizon_server_handle_get_thread_info( connection, message );
+        break;
+    case HORIZON_REQ_GET_NEXT_THREAD:
+        status = horizon_server_handle_get_next_thread( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_TIMES:
+        status = horizon_server_handle_get_thread_times( connection, message );
+        break;
+    case HORIZON_REQ_SET_THREAD_INFO:
+        status = horizon_server_handle_set_thread_info( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_FILE_OBJECT:
+        status = horizon_server_handle_open_file_object( connection, message, request_data,
+                                                         header->request_size );
+        break;
+    case HORIZON_REQ_IOCTL:
+        status = horizon_server_handle_ioctl( connection, message, request_data,
+                                              header->request_size );
+        break;
+    case HORIZON_REQ_CREATE_NAMED_PIPE:
+        status = horizon_server_handle_create_named_pipe( connection, message, request_data,
+                                                          header->request_size );
+        break;
+    case HORIZON_REQ_SET_NAMED_PIPE_INFO:
+        status = horizon_server_handle_set_named_pipe_info( connection, message );
+        break;
+    case HORIZON_REQ_RECV_SOCKET:
+    case HORIZON_REQ_SEND_SOCKET:
+        status = horizon_server_handle_socket_io( connection, message );
+        break;
+    case HORIZON_REQ_SOCKET_GET_EVENTS:
+        status = horizon_server_handle_socket_get_events( connection, message );
+        break;
+    case HORIZON_REQ_SET_ASYNC_DIRECT_RESULT:
+        status = horizon_server_handle_set_async_direct_result( connection, message );
+        break;
+    case HORIZON_REQ_REGISTER_ASYNC:
+        status = horizon_server_handle_register_async( connection, message );
+        break;
+    case HORIZON_REQ_GET_ASYNC_RESULT:
+        status = horizon_server_handle_get_async_result( connection, message );
+        break;
+    case HORIZON_REQ_CANCEL_ASYNC:
+        status = horizon_server_handle_cancel_async( connection, message );
+        break;
+    case HORIZON_REQ_QUEUE_APC:
+        status = horizon_server_handle_queue_apc( connection, message, request_data,
+                                                  header->request_size );
+        break;
+    case HORIZON_REQ_CLOSE_HANDLE:
+        status = horizon_server_handle_close_handle( connection, message );
+        break;
+    case HORIZON_REQ_SET_HANDLE_INFO:
+        status = horizon_server_handle_set_handle_info( connection );
+        break;
+    case HORIZON_REQ_DUP_HANDLE:
+        status = horizon_server_handle_dup_handle( connection, message );
+        break;
+    case HORIZON_REQ_ALLOCATE_RESERVE_OBJECT:
+        status = horizon_server_handle_allocate_reserve_object( connection, message );
+        break;
+    case HORIZON_REQ_COMPARE_OBJECTS:
+        status = horizon_server_handle_compare_objects( connection, message );
+        break;
+    case HORIZON_REQ_GET_OBJECT_INFO:
+        status = horizon_server_handle_get_object_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_OBJECT_PERMANENCE:
+        status = horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
+        break;
+    case HORIZON_REQ_OPEN_PROCESS:
+        status = horizon_server_handle_open_process( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_THREAD:
+        status = horizon_server_handle_open_thread( connection, message );
+        break;
+    case HORIZON_REQ_ADD_ATOM:
+        status = horizon_server_handle_atom( connection, request_data, header->request_size, 1 );
+        break;
+    case HORIZON_REQ_FIND_ATOM:
+        status = horizon_server_handle_atom( connection, request_data, header->request_size, 0 );
+        break;
+    case HORIZON_REQ_SEND_MESSAGE:
+        status = horizon_server_handle_send_message( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_ADD_USER_ATOM:
+        status = horizon_server_handle_add_user_atom( connection, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_GET_USER_ATOM_NAME:
+        status = horizon_server_handle_get_user_atom_name( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_CLIPBOARD:
+    case HORIZON_REQ_CLOSE_CLIPBOARD:
+    case HORIZON_REQ_EMPTY_CLIPBOARD:
+    case HORIZON_REQ_SET_CLIPBOARD_DATA:
+    case HORIZON_REQ_GET_CLIPBOARD_DATA:
+    case HORIZON_REQ_GET_CLIPBOARD_FORMATS:
+    case HORIZON_REQ_ENUM_CLIPBOARD_FORMATS:
+    case HORIZON_REQ_RELEASE_CLIPBOARD:
+    case HORIZON_REQ_GET_CLIPBOARD_INFO:
+    case HORIZON_REQ_SET_CLIPBOARD_VIEWER:
+    case HORIZON_REQ_ADD_CLIPBOARD_LISTENER:
+    case HORIZON_REQ_REMOVE_CLIPBOARD_LISTENER:
+        status = horizon_server_handle_clipboard( connection, header->req, message, request_data,
+                                                  header->request_size );
+        break;
+    case HORIZON_REQ_REPLY_MESSAGE:
+        status = horizon_server_handle_reply_message( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_GET_MESSAGE_REPLY:
+        status = horizon_server_handle_get_message_reply( connection, message );
+        break;
+    case HORIZON_REQ_GET_MSG_QUEUE:
+        status = horizon_server_handle_get_msg_queue( connection );
+        break;
+    case HORIZON_REQ_GET_MSG_QUEUE_HANDLE:
+        status = horizon_server_handle_get_msg_queue_handle( connection );
+        break;
+    case HORIZON_REQ_SET_QUEUE_MASK:
+        status = horizon_server_handle_set_queue_mask( connection, message );
+        break;
+    case HORIZON_REQ_GET_QUEUE_STATUS:
+        status = horizon_server_handle_get_queue_status( connection, message );
+        break;
+    case HORIZON_REQ_POST_QUIT_MESSAGE:
+        status = horizon_server_handle_post_quit_message( connection, message );
+        break;
+    case HORIZON_REQ_SET_WIN_TIMER:
+        status = horizon_server_handle_set_win_timer( connection, message );
+        break;
+    case HORIZON_REQ_KILL_WIN_TIMER:
+        status = horizon_server_handle_kill_win_timer( connection, message );
+        break;
+    case HORIZON_REQ_SEND_HARDWARE_MESSAGE:
+        status = horizon_server_handle_send_hardware_message( connection, message );
+        break;
+    case HORIZON_REQ_GET_MESSAGE:
+        status = horizon_server_handle_get_message( connection, message );
+        break;
+    case HORIZON_REQ_ACCEPT_HARDWARE_MESSAGE:
+        status = horizon_server_handle_accept_hardware_message( connection, message );
+        break;
+    case HORIZON_REQ_ALLOC_USER_HANDLE:
+        status = horizon_server_handle_alloc_user_handle( connection, message );
+        break;
+    case HORIZON_REQ_FREE_USER_HANDLE:
+        status = horizon_server_handle_free_user_handle( connection, message );
+        break;
+    case HORIZON_REQ_SELECT:
+        status = horizon_server_handle_select( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_CREATE_EVENT:
+        status = horizon_server_handle_create_event( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_EVENT_OP:
+        status = horizon_server_handle_event_op( connection, message );
+        break;
+    case HORIZON_REQ_QUERY_EVENT:
+        status = horizon_server_handle_query_event( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_COMPLETION:
+        status = horizon_server_handle_create_completion( connection, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_COMPLETION:
+        status = horizon_server_handle_open_named_object( connection, message, request_data,
+                                                          header->request_size, HORIZON_SERVER_OBJECT_COMPLETION );
+        break;
+    case HORIZON_REQ_ADD_COMPLETION:
+        status = horizon_server_handle_add_completion( connection, message );
+        break;
+    case HORIZON_REQ_REMOVE_COMPLETION:
+        status = horizon_server_handle_remove_completion( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_COMPLETION:
+        status = horizon_server_handle_get_thread_completion( connection );
+        break;
+    case HORIZON_REQ_QUERY_COMPLETION:
+        status = horizon_server_handle_query_completion( connection, message );
+        break;
+    case HORIZON_REQ_SET_COMPLETION_INFO:
+        status = horizon_server_handle_set_completion_info( connection, message );
+        break;
+    case HORIZON_REQ_ADD_FD_COMPLETION:
+        status = horizon_server_handle_add_fd_completion( connection, message );
+        break;
+    case HORIZON_REQ_SET_FD_COMPLETION_MODE:
+        status = horizon_server_handle_set_fd_completion_mode( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_EVENT:
+        status = horizon_server_handle_open_named_object( connection, message, request_data,
+                                                          header->request_size, HORIZON_SERVER_OBJECT_EVENT );
+        break;
+    case HORIZON_REQ_OPEN_DIRECTORY:
+        status = horizon_server_handle_open_directory( connection, message, request_data,
+                                                       header->request_size );
+        break;
+    case HORIZON_REQ_GET_DIRECTORY_ENTRIES:
+        status = horizon_server_handle_get_directory_entries( connection, message );
+        break;
+    case HORIZON_REQ_UPDATE_RAWINPUT_DEVICES:
+        status = horizon_server_handle_update_rawinput_devices( connection, request_data,
+                                                                header->request_size );
+        break;
+    case HORIZON_REQ_CREATE_KEYED_EVENT:
+        status = horizon_server_handle_create_keyed_event( connection, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_KEYED_EVENT:
+        status = horizon_server_handle_open_named_object(
+            connection, message, request_data, header->request_size, HORIZON_SERVER_OBJECT_KEYED_EVENT );
+        break;
+    case HORIZON_REQ_CREATE_MUTEX:
+        status = horizon_server_handle_create_mutex( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_RELEASE_MUTEX:
+        status = horizon_server_handle_release_mutex( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_MUTEX:
+        status = horizon_server_handle_open_named_object( connection, message, request_data,
+                                                          header->request_size, HORIZON_SERVER_OBJECT_MUTEX );
+        break;
+    case HORIZON_REQ_QUERY_MUTEX:
+        status = horizon_server_handle_query_mutex( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_SEMAPHORE:
+        status = horizon_server_handle_create_semaphore( connection, message, request_data,
+                                                         header->request_size );
+        break;
+    case HORIZON_REQ_RELEASE_SEMAPHORE:
+        status = horizon_server_handle_release_semaphore( connection, message );
+        break;
+    case HORIZON_REQ_QUERY_SEMAPHORE:
+        status = horizon_server_handle_query_semaphore( connection, message );
+        break;
+    case HORIZON_REQ_OPEN_SEMAPHORE:
+        status = horizon_server_handle_open_named_object(
+            connection, message, request_data, header->request_size, HORIZON_SERVER_OBJECT_SEMAPHORE );
+        break;
+    case HORIZON_REQ_CREATE_FILE:
+        status = horizon_server_handle_create_file( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_GET_HANDLE_UNIX_NAME:
+        status = horizon_server_handle_get_handle_unix_name( connection, message );
+        break;
+    case HORIZON_REQ_SET_FD_EOF_INFO:
+        status = horizon_server_handle_set_fd_eof_info( connection, message );
+        break;
+    case HORIZON_REQ_LOCK_FILE:
+        status = horizon_server_handle_lock_file( connection, message );
+        break;
+    case HORIZON_REQ_UNLOCK_FILE:
+        status = horizon_server_handle_unlock_file( connection, message );
+        break;
+    case HORIZON_REQ_SET_FD_DISP_INFO:
+        status = horizon_server_handle_set_fd_disp_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_FD_NAME_INFO:
+        status = horizon_server_handle_set_fd_name_info( connection, message, request_data,
+                                                         header->request_size );
+        break;
+    case HORIZON_REQ_GET_HANDLE_FD:
+        status = horizon_server_handle_get_handle_fd( connection, message );
+        break;
+    case HORIZON_REQ_QUERY_DIRECTORY_FILE:
+        status = horizon_server_handle_query_directory_file( connection, message, request_data,
+                                                             header->request_size );
+        break;
+    case HORIZON_REQ_CREATE_MAPPING:
+        status = horizon_server_handle_create_mapping( connection, message, request_data,
+                                                       header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_MAPPING:
+        status = horizon_server_handle_open_mapping( connection, message, request_data,
+                                                     header->request_size );
+        break;
+    case HORIZON_REQ_GET_MAPPING_INFO:
+        status = horizon_server_handle_get_mapping_info( connection, message );
+        break;
+    case HORIZON_REQ_GET_IMAGE_MAP_ADDRESS:
+        status = horizon_server_handle_get_image_map_address( connection, message );
+        break;
+    case HORIZON_REQ_MAP_VIEW:
+        status = horizon_server_handle_map_view( connection, message );
+        break;
+    case HORIZON_REQ_MAP_IMAGE_VIEW:
+        status = horizon_server_handle_map_image_view( connection, message );
+        break;
+    case HORIZON_REQ_UNMAP_VIEW:
+        status = horizon_server_handle_unmap_view( connection, message );
+        break;
+    case HORIZON_REQ_GET_MAPPING_COMMITTED_RANGE:
+        status = horizon_server_handle_get_mapping_committed_range( connection, message );
+        break;
+    case HORIZON_REQ_ADD_MAPPING_COMMITTED_RANGE:
+        status = horizon_server_handle_add_mapping_committed_range( connection, message );
+        break;
+    case HORIZON_REQ_IS_SAME_MAPPING:
+        status = horizon_server_handle_is_same_mapping( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_TIMER:
+        status = horizon_server_handle_create_timer( connection, message, request_data, header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_TIMER:
+        status = horizon_server_handle_open_named_object( connection, message, request_data,
+                                                          header->request_size, HORIZON_SERVER_OBJECT_TIMER );
+        break;
+    case HORIZON_REQ_SET_TIMER:
+        status = horizon_server_handle_set_timer( connection, message );
+        break;
+    case HORIZON_REQ_CANCEL_TIMER:
+        status = horizon_server_handle_cancel_timer( connection, message );
+        break;
+    case HORIZON_REQ_GET_TIMER_INFO:
+        status = horizon_server_handle_get_timer_info( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_WINDOW:
+        status = horizon_server_handle_create_window( connection, message, request_data,
+                                                      header->request_size );
+        break;
+    case HORIZON_REQ_DESTROY_WINDOW:
+        status = horizon_server_handle_destroy_window( connection, message );
+        break;
+    case HORIZON_REQ_GET_DESKTOP_WINDOW:
+        status = horizon_server_handle_get_desktop_window( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_OWNER:
+        status = horizon_server_handle_set_window_owner( connection, message );
+        break;
+    case HORIZON_REQ_SET_PARENT:
+        status = horizon_server_handle_set_parent( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_PARENTS:
+        status = horizon_server_handle_get_window_parents( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_INFO:
+        status = horizon_server_handle_get_window_info( connection, message );
+        break;
+    case HORIZON_REQ_INIT_WINDOW_INFO:
+        status = horizon_server_handle_init_window_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_INFO:
+        status = horizon_server_handle_set_window_info( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_CHILDREN_FROM_POINT:
+        status = horizon_server_handle_get_window_children_from_point( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_LIST:
+        status = horizon_server_handle_get_window_list( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_TREE:
+        status = horizon_server_handle_get_window_tree( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_POS:
+        status = horizon_server_handle_set_window_pos( connection, message, request_data,
+                                                       header->request_size );
+        break;
+    case HORIZON_REQ_GET_WINDOW_RECTANGLES:
+        status = horizon_server_handle_get_window_rectangles( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_TEXT:
+        status = horizon_server_handle_get_window_text( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_TEXT:
+        status = horizon_server_handle_set_window_text( connection, message, request_data,
+                                                        header->request_size );
+        break;
+    case HORIZON_REQ_GET_WINDOWS_OFFSET:
+        status = horizon_server_handle_get_windows_offset( connection, message );
+        break;
+    case HORIZON_REQ_GET_VISIBLE_REGION:
+        status = horizon_server_handle_get_visible_region( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_REGION:
+        status = horizon_server_handle_get_window_region( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_REGION:
+        status = horizon_server_handle_set_window_region( connection, message, request_data,
+                                                          header->request_size );
+        break;
+    case HORIZON_REQ_GET_UPDATE_REGION:
+        status = horizon_server_handle_get_update_region( connection, message );
+        break;
+    case HORIZON_REQ_UPDATE_WINDOW_ZORDER:
+        status = horizon_server_handle_update_window_zorder( connection, message );
+        break;
+    case HORIZON_REQ_REDRAW_WINDOW:
+        status = horizon_server_handle_redraw_window( connection, message, request_data,
+                                                      header->request_size );
+        break;
+    case HORIZON_REQ_SET_WINDOW_PROPERTY:
+        status = horizon_server_handle_set_window_property( connection, message, request_data,
+                                                            header->request_size );
+        break;
+    case HORIZON_REQ_REMOVE_WINDOW_PROPERTY:
+        status = horizon_server_handle_get_window_property( connection, message, request_data,
+                                                            header->request_size, 1 );
+        break;
+    case HORIZON_REQ_GET_WINDOW_PROPERTY:
+        status = horizon_server_handle_get_window_property( connection, message, request_data,
+                                                            header->request_size, 0 );
+        break;
+    case HORIZON_REQ_GET_WINDOW_PROPERTIES:
+        status = horizon_server_handle_get_window_properties( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_WINSTATION:
+        status = horizon_server_handle_create_winstation( connection, message, request_data,
+                                                          header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_WINSTATION:
+        status = horizon_server_handle_open_winstation( connection, message, request_data,
+                                                        header->request_size );
+        break;
+    case HORIZON_REQ_CLOSE_WINSTATION:
+        status = horizon_server_handle_close_handle( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINSTATION_MONITORS:
+        status = horizon_server_handle_set_winstation_monitors( connection, message );
+        break;
+    case HORIZON_REQ_GET_PROCESS_WINSTATION:
+        status = horizon_server_handle_get_process_winstation( connection );
+        break;
+    case HORIZON_REQ_SET_PROCESS_WINSTATION:
+        status = horizon_server_handle_set_process_winstation( connection, message );
+        break;
+    case HORIZON_REQ_ENUM_WINSTATION:
+        status = horizon_server_handle_enum_winstation( connection );
+        break;
+    case HORIZON_REQ_CREATE_DESKTOP:
+        status = horizon_server_handle_create_desktop( connection, message, request_data,
+                                                       header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_DESKTOP:
+        status = horizon_server_handle_open_desktop( connection, message, request_data,
+                                                     header->request_size );
+        break;
+    case HORIZON_REQ_OPEN_INPUT_DESKTOP:
+        status = horizon_server_handle_open_input_desktop( connection );
+        break;
+    case HORIZON_REQ_SET_INPUT_DESKTOP:
+        status = horizon_server_handle_set_input_desktop( connection, message );
+        break;
+    case HORIZON_REQ_CLOSE_DESKTOP:
+        status = horizon_server_handle_close_handle( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_DESKTOP:
+        status = horizon_server_handle_get_thread_desktop( connection, message );
+        break;
+    case HORIZON_REQ_SET_THREAD_DESKTOP:
+        status = horizon_server_handle_set_thread_desktop( connection, message );
+        break;
+    case HORIZON_REQ_SET_USER_OBJECT_INFO:
+        status = horizon_server_handle_set_user_object_info( connection, message );
+        break;
+    case HORIZON_REQ_GET_THREAD_INPUT:
+        status = horizon_server_handle_get_thread_input( connection, message );
+        break;
+    case HORIZON_REQ_SET_FOREGROUND_WINDOW:
+        status = horizon_server_handle_set_foreground_window( connection, message );
+        break;
+    case HORIZON_REQ_SET_FOCUS_WINDOW:
+    case HORIZON_REQ_SET_ACTIVE_WINDOW:
+        status = horizon_server_handle_set_input_window( connection, message, header->req );
+        break;
+    case HORIZON_REQ_SET_CAPTURE_WINDOW:
+        status = horizon_server_handle_set_capture_window( connection, message );
+        break;
+    case HORIZON_REQ_SET_CARET_WINDOW:
+        status = horizon_server_handle_set_caret_window( connection, message );
+        break;
+    case HORIZON_REQ_SET_CARET_INFO:
+        status = horizon_server_handle_set_caret_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_CLASS_INFO:
+        status = horizon_server_handle_set_class_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_FNID:
+        status = horizon_server_handle_set_window_fnid( connection, message );
+        break;
+    case HORIZON_REQ_CREATE_CLASS:
+        status = horizon_server_handle_create_class( connection, message, request_data,
+                                                     header->request_size );
+        break;
+    case HORIZON_REQ_DESTROY_CLASS:
+        status = horizon_server_handle_destroy_class( connection, message, request_data,
+                                                      header->request_size );
+        break;
+    case HORIZON_REQ_SET_CURSOR:
+        status = horizon_server_handle_set_cursor( connection, message );
+        break;
+    case HORIZON_REQ_GET_WINDOW_LAYERED_INFO:
+        status = horizon_server_handle_get_window_layered_info( connection, message );
+        break;
+    case HORIZON_REQ_SET_WINDOW_LAYERED_INFO:
+        status = horizon_server_handle_set_window_layered_info( connection, message );
+        break;
+    case HORIZON_REQ_GET_KEY_STATE:
+        status = horizon_server_handle_get_key_state( connection, message );
+        break;
+    default:
+    {
+        WARN( "unimplemented Horizon server request %d size %u reply_size %u.\n",
+              header->req, header->request_size, header->reply_size );
+        if (connection->reply_fd != -1)
+            status = horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_NOT_IMPLEMENTED );
+        break;
+    }
+    }
+    return status;
+}
+
+/* A client request on an inline connection, served on the calling thread.
+ * Returns 0 when request_fd's connection has its own pthread. */
+int horizon_server_inline_call( int request_fd, const void *message, const void *data,
+                                unsigned int data_size, void *reply, void *reply_data )
+{
+    struct horizon_pipe *pipe = horizon_pipe_from_fd( request_fd );
+    struct horizon_server_connection *connection, *previous;
+    unsigned char request[HORIZON_SERVER_FIXED_MESSAGE_SIZE];
+    struct horizon_server_request_header *header = (void *)request;
+    unsigned char *request_data = NULL;
+
+    if (!pipe || !(connection = __atomic_load_n( &pipe->inline_connection, __ATOMIC_ACQUIRE ))) return 0;
+    {
+        extern volatile int wine_nx_quit_requested __attribute__((weak));
+        extern void wine_nx_quit_point( void ) __attribute__((weak));
+
+        if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+    }
+    memcpy( request, message, sizeof(request) );
+    memset( reply, 0, HORIZON_SERVER_FIXED_MESSAGE_SIZE );
+    if (header->request_size != data_size ||
+        (data_size && !(request_data = malloc( data_size ))))
+    {
+        ((struct horizon_server_reply_header *)reply)->error = HORIZON_STATUS_NO_MEMORY;
+        return 1;
+    }
+    if (data_size) memcpy( request_data, data, data_size );
+
+    connection->inline_reply = reply;
+    connection->inline_data = reply_data;
+    connection->inline_size = reply_data ? header->reply_size : 0;
+    connection->inline_replied = 0;
+    previous = horizon_server_current;
+    horizon_server_current = connection;
+    horizon_server_dispatch( connection, request, request_data );
+    horizon_server_current = previous;
+    connection->inline_reply = NULL;
+    connection->inline_data = NULL;
+    connection->inline_size = 0;
+    free( request_data );
+
+    if (!connection->inline_replied)
+    {
+        WARN( "inline Horizon server request %d wrote no reply.\n", header->req );
+        memset( reply, 0, HORIZON_SERVER_FIXED_MESSAGE_SIZE );
+        ((struct horizon_server_reply_header *)reply)->error = HORIZON_STATUS_UNSUCCESSFUL;
+    }
+    return 1;
+}
+
+/* The client of an inline connection closes its request pipe: what the
+ * connection pthread does when it reads the end of that pipe. */
+void horizon_server_inline_release( int request_fd )
+{
+    struct horizon_pipe *pipe = horizon_pipe_from_fd( request_fd );
+    struct horizon_server_connection *connection;
+
+    if (!pipe || !(connection = __atomic_exchange_n( &pipe->inline_connection, NULL, __ATOMIC_ACQ_REL )))
+        return;
+    if (connection->reply_fd != -1) close( connection->reply_fd );
+    if (connection->wait_fd != -1) close( connection->wait_fd );
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (connection->thread)
+    {
+        horizon_server_end_thread_locked( connection );
+        __atomic_sub_fetch( &horizon_lifecycle.connections, 1, __ATOMIC_RELAXED );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    /* The read end last: it holds the pipe the caller is about to close. */
+    if (connection->request_fd != -1) close( connection->request_fd );
+    if (horizon_server_current == connection) horizon_server_current = NULL;
+    free( connection );
+}
+
 static void *horizon_server_thread( void *param )
 {
     struct horizon_server_connection *connection = param;
@@ -16716,561 +17391,7 @@ static void *horizon_server_thread( void *param )
             }
         }
 
-        switch (header->req)
-        {
-        case HORIZON_REQ_GET_TOKEN_SID:
-            status = horizon_server_handle_registry_user( connection, message );
-            break;
-        case HORIZON_REQ_ALLOCATE_LOCALLY_UNIQUE_ID:
-            status = horizon_server_handle_allocate_locally_unique_id( connection );
-            break;
-        case HORIZON_REQ_CREATE_KEY:
-        case HORIZON_REQ_OPEN_KEY:
-        case HORIZON_REQ_DELETE_KEY:
-        case HORIZON_REQ_ENUM_KEY:
-        case HORIZON_REQ_SET_KEY_VALUE:
-        case HORIZON_REQ_GET_KEY_VALUE:
-        case HORIZON_REQ_ENUM_KEY_VALUE:
-        case HORIZON_REQ_DELETE_KEY_VALUE:
-        case HORIZON_REQ_SET_REGISTRY_NOTIFICATION:
-        case HORIZON_REQ_RENAME_KEY:
-            status = horizon_server_handle_registry( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_INIT_FIRST_THREAD:
-            status = horizon_server_handle_init_first_thread( connection, message );
-            break;
-        case HORIZON_REQ_INIT_PROCESS_DONE:
-            status = horizon_server_handle_init_process_done( connection, message );
-            break;
-        case HORIZON_REQ_INIT_THREAD:
-            status = horizon_server_handle_init_thread( connection, message );
-            break;
-        case HORIZON_REQ_NEW_THREAD:
-            status = horizon_server_handle_new_thread( connection, message );
-            break;
-        case HORIZON_REQ_SUSPEND_THREAD:
-            status = horizon_server_handle_suspend_thread( connection, message );
-            break;
-        case HORIZON_REQ_RESUME_THREAD:
-            status = horizon_server_handle_resume_thread( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_CONTEXT:
-            status = horizon_server_handle_get_thread_context( connection, message );
-            break;
-        case HORIZON_REQ_SET_THREAD_CONTEXT:
-            status = horizon_server_handle_set_thread_context( connection, message, request_data,
-                                                               header->request_size );
-            break;
-        case HORIZON_REQ_TERMINATE_THREAD:
-            status = horizon_server_handle_terminate_thread( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_INFO:
-            status = horizon_server_handle_get_thread_info( connection, message );
-            break;
-        case HORIZON_REQ_GET_NEXT_THREAD:
-            status = horizon_server_handle_get_next_thread( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_TIMES:
-            status = horizon_server_handle_get_thread_times( connection, message );
-            break;
-        case HORIZON_REQ_SET_THREAD_INFO:
-            status = horizon_server_handle_set_thread_info( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_FILE_OBJECT:
-            status = horizon_server_handle_open_file_object( connection, message, request_data,
-                                                             header->request_size );
-            break;
-        case HORIZON_REQ_IOCTL:
-            status = horizon_server_handle_ioctl( connection, message, request_data,
-                                                  header->request_size );
-            break;
-        case HORIZON_REQ_CREATE_NAMED_PIPE:
-            status = horizon_server_handle_create_named_pipe( connection, message, request_data,
-                                                              header->request_size );
-            break;
-        case HORIZON_REQ_SET_NAMED_PIPE_INFO:
-            status = horizon_server_handle_set_named_pipe_info( connection, message );
-            break;
-        case HORIZON_REQ_RECV_SOCKET:
-        case HORIZON_REQ_SEND_SOCKET:
-            status = horizon_server_handle_socket_io( connection, message );
-            break;
-        case HORIZON_REQ_SOCKET_GET_EVENTS:
-            status = horizon_server_handle_socket_get_events( connection, message );
-            break;
-        case HORIZON_REQ_SET_ASYNC_DIRECT_RESULT:
-            status = horizon_server_handle_set_async_direct_result( connection, message );
-            break;
-        case HORIZON_REQ_REGISTER_ASYNC:
-            status = horizon_server_handle_register_async( connection, message );
-            break;
-        case HORIZON_REQ_GET_ASYNC_RESULT:
-            status = horizon_server_handle_get_async_result( connection, message );
-            break;
-        case HORIZON_REQ_CANCEL_ASYNC:
-            status = horizon_server_handle_cancel_async( connection, message );
-            break;
-        case HORIZON_REQ_QUEUE_APC:
-            status = horizon_server_handle_queue_apc( connection, message, request_data,
-                                                      header->request_size );
-            break;
-        case HORIZON_REQ_CLOSE_HANDLE:
-            status = horizon_server_handle_close_handle( connection, message );
-            break;
-        case HORIZON_REQ_SET_HANDLE_INFO:
-            status = horizon_server_handle_set_handle_info( connection );
-            break;
-        case HORIZON_REQ_DUP_HANDLE:
-            status = horizon_server_handle_dup_handle( connection, message );
-            break;
-        case HORIZON_REQ_ALLOCATE_RESERVE_OBJECT:
-            status = horizon_server_handle_allocate_reserve_object( connection, message );
-            break;
-        case HORIZON_REQ_COMPARE_OBJECTS:
-            status = horizon_server_handle_compare_objects( connection, message );
-            break;
-        case HORIZON_REQ_GET_OBJECT_INFO:
-            status = horizon_server_handle_get_object_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_OBJECT_PERMANENCE:
-            status = horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_SUCCESS );
-            break;
-        case HORIZON_REQ_OPEN_PROCESS:
-            status = horizon_server_handle_open_process( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_THREAD:
-            status = horizon_server_handle_open_thread( connection, message );
-            break;
-        case HORIZON_REQ_ADD_ATOM:
-            status = horizon_server_handle_atom( connection, request_data, header->request_size, 1 );
-            break;
-        case HORIZON_REQ_FIND_ATOM:
-            status = horizon_server_handle_atom( connection, request_data, header->request_size, 0 );
-            break;
-        case HORIZON_REQ_SEND_MESSAGE:
-            status = horizon_server_handle_send_message( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_ADD_USER_ATOM:
-            status = horizon_server_handle_add_user_atom( connection, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_GET_USER_ATOM_NAME:
-            status = horizon_server_handle_get_user_atom_name( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_CLIPBOARD:
-        case HORIZON_REQ_CLOSE_CLIPBOARD:
-        case HORIZON_REQ_EMPTY_CLIPBOARD:
-        case HORIZON_REQ_SET_CLIPBOARD_DATA:
-        case HORIZON_REQ_GET_CLIPBOARD_DATA:
-        case HORIZON_REQ_GET_CLIPBOARD_FORMATS:
-        case HORIZON_REQ_ENUM_CLIPBOARD_FORMATS:
-        case HORIZON_REQ_RELEASE_CLIPBOARD:
-        case HORIZON_REQ_GET_CLIPBOARD_INFO:
-        case HORIZON_REQ_SET_CLIPBOARD_VIEWER:
-        case HORIZON_REQ_ADD_CLIPBOARD_LISTENER:
-        case HORIZON_REQ_REMOVE_CLIPBOARD_LISTENER:
-            status = horizon_server_handle_clipboard( connection, header->req, message, request_data,
-                                                      header->request_size );
-            break;
-        case HORIZON_REQ_REPLY_MESSAGE:
-            status = horizon_server_handle_reply_message( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_GET_MESSAGE_REPLY:
-            status = horizon_server_handle_get_message_reply( connection, message );
-            break;
-        case HORIZON_REQ_GET_MSG_QUEUE:
-            status = horizon_server_handle_get_msg_queue( connection );
-            break;
-        case HORIZON_REQ_GET_MSG_QUEUE_HANDLE:
-            status = horizon_server_handle_get_msg_queue_handle( connection );
-            break;
-        case HORIZON_REQ_SET_QUEUE_MASK:
-            status = horizon_server_handle_set_queue_mask( connection, message );
-            break;
-        case HORIZON_REQ_GET_QUEUE_STATUS:
-            status = horizon_server_handle_get_queue_status( connection, message );
-            break;
-        case HORIZON_REQ_POST_QUIT_MESSAGE:
-            status = horizon_server_handle_post_quit_message( connection, message );
-            break;
-        case HORIZON_REQ_SET_WIN_TIMER:
-            status = horizon_server_handle_set_win_timer( connection, message );
-            break;
-        case HORIZON_REQ_KILL_WIN_TIMER:
-            status = horizon_server_handle_kill_win_timer( connection, message );
-            break;
-        case HORIZON_REQ_SEND_HARDWARE_MESSAGE:
-            status = horizon_server_handle_send_hardware_message( connection, message );
-            break;
-        case HORIZON_REQ_GET_MESSAGE:
-            status = horizon_server_handle_get_message( connection, message );
-            break;
-        case HORIZON_REQ_ACCEPT_HARDWARE_MESSAGE:
-            status = horizon_server_handle_accept_hardware_message( connection, message );
-            break;
-        case HORIZON_REQ_ALLOC_USER_HANDLE:
-            status = horizon_server_handle_alloc_user_handle( connection, message );
-            break;
-        case HORIZON_REQ_FREE_USER_HANDLE:
-            status = horizon_server_handle_free_user_handle( connection, message );
-            break;
-        case HORIZON_REQ_SELECT:
-            status = horizon_server_handle_select( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_CREATE_EVENT:
-            status = horizon_server_handle_create_event( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_EVENT_OP:
-            status = horizon_server_handle_event_op( connection, message );
-            break;
-        case HORIZON_REQ_QUERY_EVENT:
-            status = horizon_server_handle_query_event( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_COMPLETION:
-            status = horizon_server_handle_create_completion( connection, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_COMPLETION:
-            status = horizon_server_handle_open_named_object( connection, message, request_data,
-                                                              header->request_size, HORIZON_SERVER_OBJECT_COMPLETION );
-            break;
-        case HORIZON_REQ_ADD_COMPLETION:
-            status = horizon_server_handle_add_completion( connection, message );
-            break;
-        case HORIZON_REQ_REMOVE_COMPLETION:
-            status = horizon_server_handle_remove_completion( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_COMPLETION:
-            status = horizon_server_handle_get_thread_completion( connection );
-            break;
-        case HORIZON_REQ_QUERY_COMPLETION:
-            status = horizon_server_handle_query_completion( connection, message );
-            break;
-        case HORIZON_REQ_SET_COMPLETION_INFO:
-            status = horizon_server_handle_set_completion_info( connection, message );
-            break;
-        case HORIZON_REQ_ADD_FD_COMPLETION:
-            status = horizon_server_handle_add_fd_completion( connection, message );
-            break;
-        case HORIZON_REQ_SET_FD_COMPLETION_MODE:
-            status = horizon_server_handle_set_fd_completion_mode( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_EVENT:
-            status = horizon_server_handle_open_named_object( connection, message, request_data,
-                                                              header->request_size, HORIZON_SERVER_OBJECT_EVENT );
-            break;
-        case HORIZON_REQ_OPEN_DIRECTORY:
-            status = horizon_server_handle_open_directory( connection, message, request_data,
-                                                           header->request_size );
-            break;
-        case HORIZON_REQ_GET_DIRECTORY_ENTRIES:
-            status = horizon_server_handle_get_directory_entries( connection, message );
-            break;
-        case HORIZON_REQ_UPDATE_RAWINPUT_DEVICES:
-            status = horizon_server_handle_update_rawinput_devices( connection, request_data,
-                                                                    header->request_size );
-            break;
-        case HORIZON_REQ_CREATE_KEYED_EVENT:
-            status = horizon_server_handle_create_keyed_event( connection, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_KEYED_EVENT:
-            status = horizon_server_handle_open_named_object(
-                connection, message, request_data, header->request_size, HORIZON_SERVER_OBJECT_KEYED_EVENT );
-            break;
-        case HORIZON_REQ_CREATE_MUTEX:
-            status = horizon_server_handle_create_mutex( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_RELEASE_MUTEX:
-            status = horizon_server_handle_release_mutex( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_MUTEX:
-            status = horizon_server_handle_open_named_object( connection, message, request_data,
-                                                              header->request_size, HORIZON_SERVER_OBJECT_MUTEX );
-            break;
-        case HORIZON_REQ_QUERY_MUTEX:
-            status = horizon_server_handle_query_mutex( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_SEMAPHORE:
-            status = horizon_server_handle_create_semaphore( connection, message, request_data,
-                                                             header->request_size );
-            break;
-        case HORIZON_REQ_RELEASE_SEMAPHORE:
-            status = horizon_server_handle_release_semaphore( connection, message );
-            break;
-        case HORIZON_REQ_QUERY_SEMAPHORE:
-            status = horizon_server_handle_query_semaphore( connection, message );
-            break;
-        case HORIZON_REQ_OPEN_SEMAPHORE:
-            status = horizon_server_handle_open_named_object(
-                connection, message, request_data, header->request_size, HORIZON_SERVER_OBJECT_SEMAPHORE );
-            break;
-        case HORIZON_REQ_CREATE_FILE:
-            status = horizon_server_handle_create_file( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_GET_HANDLE_UNIX_NAME:
-            status = horizon_server_handle_get_handle_unix_name( connection, message );
-            break;
-        case HORIZON_REQ_SET_FD_EOF_INFO:
-            status = horizon_server_handle_set_fd_eof_info( connection, message );
-            break;
-        case HORIZON_REQ_LOCK_FILE:
-            status = horizon_server_handle_lock_file( connection, message );
-            break;
-        case HORIZON_REQ_UNLOCK_FILE:
-            status = horizon_server_handle_unlock_file( connection, message );
-            break;
-        case HORIZON_REQ_SET_FD_DISP_INFO:
-            status = horizon_server_handle_set_fd_disp_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_FD_NAME_INFO:
-            status = horizon_server_handle_set_fd_name_info( connection, message, request_data,
-                                                             header->request_size );
-            break;
-        case HORIZON_REQ_GET_HANDLE_FD:
-            status = horizon_server_handle_get_handle_fd( connection, message );
-            break;
-        case HORIZON_REQ_QUERY_DIRECTORY_FILE:
-            status = horizon_server_handle_query_directory_file( connection, message, request_data,
-                                                                 header->request_size );
-            break;
-        case HORIZON_REQ_CREATE_MAPPING:
-            status = horizon_server_handle_create_mapping( connection, message, request_data,
-                                                           header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_MAPPING:
-            status = horizon_server_handle_open_mapping( connection, message, request_data,
-                                                         header->request_size );
-            break;
-        case HORIZON_REQ_GET_MAPPING_INFO:
-            status = horizon_server_handle_get_mapping_info( connection, message );
-            break;
-        case HORIZON_REQ_GET_IMAGE_MAP_ADDRESS:
-            status = horizon_server_handle_get_image_map_address( connection, message );
-            break;
-        case HORIZON_REQ_MAP_VIEW:
-            status = horizon_server_handle_map_view( connection, message );
-            break;
-        case HORIZON_REQ_MAP_IMAGE_VIEW:
-            status = horizon_server_handle_map_image_view( connection, message );
-            break;
-        case HORIZON_REQ_UNMAP_VIEW:
-            status = horizon_server_handle_unmap_view( connection, message );
-            break;
-        case HORIZON_REQ_GET_MAPPING_COMMITTED_RANGE:
-            status = horizon_server_handle_get_mapping_committed_range( connection, message );
-            break;
-        case HORIZON_REQ_ADD_MAPPING_COMMITTED_RANGE:
-            status = horizon_server_handle_add_mapping_committed_range( connection, message );
-            break;
-        case HORIZON_REQ_IS_SAME_MAPPING:
-            status = horizon_server_handle_is_same_mapping( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_TIMER:
-            status = horizon_server_handle_create_timer( connection, message, request_data, header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_TIMER:
-            status = horizon_server_handle_open_named_object( connection, message, request_data,
-                                                              header->request_size, HORIZON_SERVER_OBJECT_TIMER );
-            break;
-        case HORIZON_REQ_SET_TIMER:
-            status = horizon_server_handle_set_timer( connection, message );
-            break;
-        case HORIZON_REQ_CANCEL_TIMER:
-            status = horizon_server_handle_cancel_timer( connection, message );
-            break;
-        case HORIZON_REQ_GET_TIMER_INFO:
-            status = horizon_server_handle_get_timer_info( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_WINDOW:
-            status = horizon_server_handle_create_window( connection, message, request_data,
-                                                          header->request_size );
-            break;
-        case HORIZON_REQ_DESTROY_WINDOW:
-            status = horizon_server_handle_destroy_window( connection, message );
-            break;
-        case HORIZON_REQ_GET_DESKTOP_WINDOW:
-            status = horizon_server_handle_get_desktop_window( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_OWNER:
-            status = horizon_server_handle_set_window_owner( connection, message );
-            break;
-        case HORIZON_REQ_SET_PARENT:
-            status = horizon_server_handle_set_parent( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_PARENTS:
-            status = horizon_server_handle_get_window_parents( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_INFO:
-            status = horizon_server_handle_get_window_info( connection, message );
-            break;
-        case HORIZON_REQ_INIT_WINDOW_INFO:
-            status = horizon_server_handle_init_window_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_INFO:
-            status = horizon_server_handle_set_window_info( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_CHILDREN_FROM_POINT:
-            status = horizon_server_handle_get_window_children_from_point( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_LIST:
-            status = horizon_server_handle_get_window_list( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_TREE:
-            status = horizon_server_handle_get_window_tree( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_POS:
-            status = horizon_server_handle_set_window_pos( connection, message, request_data,
-                                                           header->request_size );
-            break;
-        case HORIZON_REQ_GET_WINDOW_RECTANGLES:
-            status = horizon_server_handle_get_window_rectangles( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_TEXT:
-            status = horizon_server_handle_get_window_text( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_TEXT:
-            status = horizon_server_handle_set_window_text( connection, message, request_data,
-                                                            header->request_size );
-            break;
-        case HORIZON_REQ_GET_WINDOWS_OFFSET:
-            status = horizon_server_handle_get_windows_offset( connection, message );
-            break;
-        case HORIZON_REQ_GET_VISIBLE_REGION:
-            status = horizon_server_handle_get_visible_region( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_REGION:
-            status = horizon_server_handle_get_window_region( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_REGION:
-            status = horizon_server_handle_set_window_region( connection, message, request_data,
-                                                              header->request_size );
-            break;
-        case HORIZON_REQ_GET_UPDATE_REGION:
-            status = horizon_server_handle_get_update_region( connection, message );
-            break;
-        case HORIZON_REQ_UPDATE_WINDOW_ZORDER:
-            status = horizon_server_handle_update_window_zorder( connection, message );
-            break;
-        case HORIZON_REQ_REDRAW_WINDOW:
-            status = horizon_server_handle_redraw_window( connection, message, request_data,
-                                                          header->request_size );
-            break;
-        case HORIZON_REQ_SET_WINDOW_PROPERTY:
-            status = horizon_server_handle_set_window_property( connection, message, request_data,
-                                                                header->request_size );
-            break;
-        case HORIZON_REQ_REMOVE_WINDOW_PROPERTY:
-            status = horizon_server_handle_get_window_property( connection, message, request_data,
-                                                                header->request_size, 1 );
-            break;
-        case HORIZON_REQ_GET_WINDOW_PROPERTY:
-            status = horizon_server_handle_get_window_property( connection, message, request_data,
-                                                                header->request_size, 0 );
-            break;
-        case HORIZON_REQ_GET_WINDOW_PROPERTIES:
-            status = horizon_server_handle_get_window_properties( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_WINSTATION:
-            status = horizon_server_handle_create_winstation( connection, message, request_data,
-                                                              header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_WINSTATION:
-            status = horizon_server_handle_open_winstation( connection, message, request_data,
-                                                            header->request_size );
-            break;
-        case HORIZON_REQ_CLOSE_WINSTATION:
-            status = horizon_server_handle_close_handle( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINSTATION_MONITORS:
-            status = horizon_server_handle_set_winstation_monitors( connection, message );
-            break;
-        case HORIZON_REQ_GET_PROCESS_WINSTATION:
-            status = horizon_server_handle_get_process_winstation( connection );
-            break;
-        case HORIZON_REQ_SET_PROCESS_WINSTATION:
-            status = horizon_server_handle_set_process_winstation( connection, message );
-            break;
-        case HORIZON_REQ_ENUM_WINSTATION:
-            status = horizon_server_handle_enum_winstation( connection );
-            break;
-        case HORIZON_REQ_CREATE_DESKTOP:
-            status = horizon_server_handle_create_desktop( connection, message, request_data,
-                                                           header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_DESKTOP:
-            status = horizon_server_handle_open_desktop( connection, message, request_data,
-                                                         header->request_size );
-            break;
-        case HORIZON_REQ_OPEN_INPUT_DESKTOP:
-            status = horizon_server_handle_open_input_desktop( connection );
-            break;
-        case HORIZON_REQ_SET_INPUT_DESKTOP:
-            status = horizon_server_handle_set_input_desktop( connection, message );
-            break;
-        case HORIZON_REQ_CLOSE_DESKTOP:
-            status = horizon_server_handle_close_handle( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_DESKTOP:
-            status = horizon_server_handle_get_thread_desktop( connection, message );
-            break;
-        case HORIZON_REQ_SET_THREAD_DESKTOP:
-            status = horizon_server_handle_set_thread_desktop( connection, message );
-            break;
-        case HORIZON_REQ_SET_USER_OBJECT_INFO:
-            status = horizon_server_handle_set_user_object_info( connection, message );
-            break;
-        case HORIZON_REQ_GET_THREAD_INPUT:
-            status = horizon_server_handle_get_thread_input( connection, message );
-            break;
-        case HORIZON_REQ_SET_FOREGROUND_WINDOW:
-            status = horizon_server_handle_set_foreground_window( connection, message );
-            break;
-        case HORIZON_REQ_SET_FOCUS_WINDOW:
-        case HORIZON_REQ_SET_ACTIVE_WINDOW:
-            status = horizon_server_handle_set_input_window( connection, message, header->req );
-            break;
-        case HORIZON_REQ_SET_CAPTURE_WINDOW:
-            status = horizon_server_handle_set_capture_window( connection, message );
-            break;
-        case HORIZON_REQ_SET_CARET_WINDOW:
-            status = horizon_server_handle_set_caret_window( connection, message );
-            break;
-        case HORIZON_REQ_SET_CARET_INFO:
-            status = horizon_server_handle_set_caret_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_CLASS_INFO:
-            status = horizon_server_handle_set_class_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_FNID:
-            status = horizon_server_handle_set_window_fnid( connection, message );
-            break;
-        case HORIZON_REQ_CREATE_CLASS:
-            status = horizon_server_handle_create_class( connection, message, request_data,
-                                                         header->request_size );
-            break;
-        case HORIZON_REQ_DESTROY_CLASS:
-            status = horizon_server_handle_destroy_class( connection, message, request_data,
-                                                          header->request_size );
-            break;
-        case HORIZON_REQ_SET_CURSOR:
-            status = horizon_server_handle_set_cursor( connection, message );
-            break;
-        case HORIZON_REQ_GET_WINDOW_LAYERED_INFO:
-            status = horizon_server_handle_get_window_layered_info( connection, message );
-            break;
-        case HORIZON_REQ_SET_WINDOW_LAYERED_INFO:
-            status = horizon_server_handle_set_window_layered_info( connection, message );
-            break;
-        case HORIZON_REQ_GET_KEY_STATE:
-            status = horizon_server_handle_get_key_state( connection, message );
-            break;
-        default:
-        {
-            WARN( "unimplemented Horizon server request %d size %u reply_size %u.\n",
-                  header->req, header->request_size, header->reply_size );
-            if (connection->reply_fd != -1)
-                status = horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_NOT_IMPLEMENTED );
-            break;
-        }
-        }
+        status = horizon_server_dispatch( connection, message, request_data );
 
         free( request_data );
         if (status) goto done;

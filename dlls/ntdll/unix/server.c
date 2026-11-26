@@ -400,6 +400,28 @@ static int horizon_sync_call( struct __server_request_info *req )
     return horizon_server_sync_call( get_thread_data()->tid,
                                      &req->u.req, data.bytes, size, &req->u.reply, req->reply_data );
 }
+
+/* A request of a thread whose connection has no pthread of its own: the
+ * server code runs here, on the thread, and writes the reply into req. */
+static int horizon_inline_call( int request_fd, struct __server_request_info *req )
+{
+    union { unsigned long long align; unsigned char bytes[1024]; } stack;
+    unsigned int size = req->u.req.request_header.request_size, offset = 0, i;
+    unsigned char *data = size <= sizeof(stack.bytes) ? stack.bytes : NULL;
+    int ret;
+
+    if (size && !data && !(data = malloc( size ))) return 0;
+    for (i = 0; i < req->data_count; i++)
+    {
+        if (req->data[i].size > size - offset) break;
+        if (req->data[i].size) memcpy( data + offset, req->data[i].ptr, req->data[i].size );
+        offset += req->data[i].size;
+    }
+    ret = horizon_server_inline_call( request_fd, &req->u.req, size ? data : NULL, offset,
+                                      &req->u.reply, req->reply_data );
+    if (data != stack.bytes) free( data );
+    return ret;
+}
 #endif
 
 unsigned int server_call_unlocked( void *req_ptr )
@@ -414,6 +436,7 @@ unsigned int server_call_unlocked( void *req_ptr )
 
 #ifdef __SWITCH__
     if (horizon_sync_call( req )) ret = req->u.reply.reply_header.error;
+    else if (horizon_inline_call( data->request_fd, req )) ret = req->u.reply.reply_header.error;
     else
 #endif
     if (!(ret = send_request( data->request_fd, req )))

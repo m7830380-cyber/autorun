@@ -70,6 +70,10 @@ extern int horizon_fast_sync_enabled;
 extern int horizon_server_profile_enabled;
 extern int horizon_server_sync_call( unsigned int tid, const void *request, const void *data,
                                      unsigned int data_size, void *reply, void *reply_data );
+/* Requests of threads whose server connection runs on the thread itself. */
+extern int horizon_server_inline_call( int request_fd, const void *request, const void *data,
+                                       unsigned int data_size, void *reply, void *reply_data );
+extern void horizon_server_inline_release( int request_fd );
 
 /* Horizon address arbitration used as a futex; timeout_ns < 0 waits forever. */
 extern int horizon_futex_wait( const int *addr, int value, long long timeout_ns );

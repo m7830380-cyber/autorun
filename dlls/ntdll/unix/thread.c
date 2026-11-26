@@ -1154,6 +1154,9 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
     close( data->wait_fd[0] );
     close( data->wait_fd[1] );
     close( data->reply_fd );
+#ifdef __SWITCH__
+    horizon_server_inline_release( data->request_fd );
+#endif
     close( data->request_fd );
 #ifdef __SWITCH__
     if (wine_nx_thread_unregister) wine_nx_thread_unregister();
@@ -1540,6 +1543,9 @@ done:
     if (status)
     {
         NtClose( *handle );
+#ifdef __SWITCH__
+        horizon_server_inline_release( data->request_fd );
+#endif
         close( data->request_fd );
         virtual_free_thread_data( data );
         return status;
@@ -1565,6 +1571,9 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     if ((status = spawn_thread( data )))
     {
         NtClose( *handle );
+#ifdef __SWITCH__
+        horizon_server_inline_release( data->request_fd );
+#endif
         close( data->request_fd );
         virtual_free_thread_data( data );
         return status;
