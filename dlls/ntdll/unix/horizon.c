@@ -3351,6 +3351,13 @@ struct horizon_server_object
 #endif
     unsigned int thread_context_count;
     int thread_context_valid;
+#ifndef HORIZON_STANDALONE_SYNTAX
+    /* Registers of a thread blocked outside the server (a futex wait), so a
+     * suspend can read them without waiting for a server call. */
+    struct context_data park_contexts[2];
+#endif
+    unsigned int park_context_count;
+    int parked;
     struct horizon_user_apc *apc_first, *apc_last;
     unsigned int rootdir;
     unsigned int name_len;
@@ -12068,18 +12075,31 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
         else if (!object->thread.started) status = HORIZON_STATUS_NOT_SUPPORTED;
         else
         {
-            while (!object->thread_context_valid && object->thread.suspend &&
+            const struct context_data *contexts;
+            unsigned int count;
+
+            while (!object->thread_context_valid && !object->parked && object->thread.suspend &&
                    !object->thread.terminated)
             {
                 horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
                 horizon_server_quit_check_locked();
             }
+            if (object->thread_context_valid)
+            {
+                contexts = object->thread_contexts;
+                count = object->thread_context_count;
+            }
+            else
+            {
+                contexts = object->park_contexts;
+                count = object->park_context_count;
+            }
             if (object->thread.terminated) status = HORIZON_STATUS_ACCESS_DENIED;
             else if (!object->thread.suspend) status = HORIZON_STATUS_UNSUCCESSFUL;
-            else for (i = 0; i < object->thread_context_count; i++)
+            else for (i = 0; i < count; i++)
             {
-                if (object->thread_contexts[i].machine != request->machine) continue;
-                context = object->thread_contexts[i];
+                if (contexts[i].machine != request->machine) continue;
+                context = contexts[i];
                 context.flags &= request->flags | request->native_flags | SERVER_CTX_EXEC_SPACE;
                 found = 1;
                 break;
@@ -12118,7 +12138,7 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
             else if (!object->thread.started) status = HORIZON_STATUS_NOT_SUPPORTED;
             else
             {
-                while (!object->thread_context_valid && object->thread.suspend &&
+                while (!object->thread_context_valid && !object->parked && object->thread.suspend &&
                        !object->thread.terminated)
                 {
                     horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
@@ -12126,6 +12146,8 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
                 }
                 if (object->thread.terminated) status = HORIZON_STATUS_ACCESS_DENIED;
                 else if (!object->thread.suspend) status = HORIZON_STATUS_UNSUCCESSFUL;
+                /* A parked thread does not take registers back until it wakes. */
+                else if (!object->thread_context_valid) status = HORIZON_STATUS_NOT_SUPPORTED;
                 else for (i = 0; i < count; i++)
                     for (j = 0; j < object->thread_context_count; j++)
                         if (contexts[i].machine == object->thread_contexts[j].machine)
@@ -12140,6 +12162,38 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
     }
     reply.header.error = status;
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
+/* A thread about to block outside the server (NtWaitForAlertByThreadId's
+ * futex) publishes its registers, so NtGetContextThread from a suspender (the
+ * Mono GC stopping the world) need not wait for a server call that never
+ * comes. On unparking it returns whether the thread is suspended; the caller
+ * then waits in the server before it runs Windows code again. */
+int horizon_thread_park( unsigned int tid, const struct context_data *contexts, int park )
+{
+    struct horizon_server_object *thread;
+    int suspended = 0;
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    for (thread = horizon_server_threads; thread; thread = thread->thread_next)
+        if (thread->thread.tid == tid && !thread->thread.terminated) break;
+    if (thread)
+    {
+        if (park)
+        {
+            memcpy( thread->park_contexts, contexts, sizeof(thread->park_contexts) );
+            thread->park_context_count = contexts[1].machine ? 2 : 1;
+            thread->parked = 1;
+            if (thread->thread.suspend) horizon_server_signal_changed_locked();
+        }
+        else
+        {
+            thread->parked = 0;
+            suspended = thread->thread.started && thread->thread.suspend;
+        }
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+    return suspended;
 }
 #else
 static int horizon_server_handle_get_thread_context( struct horizon_server_connection *connection,

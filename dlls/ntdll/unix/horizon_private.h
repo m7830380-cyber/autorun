@@ -38,6 +38,7 @@ extern __thread int horizon_suspend_pending;
 extern void horizon_wait_suspend_arm64ec(void);
 struct context_data;
 extern void horizon_capture_wait_contexts( struct context_data *server_contexts ) __attribute__((weak));
+extern int horizon_thread_park( unsigned int tid, const struct context_data *contexts, int park ) __attribute__((weak));
 extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
 extern void horizon_get_address_space_limits( void **start, void **limit );
 extern void *virtual_alloc_horizon_native( size_t size, void **token );

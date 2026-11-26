@@ -3702,7 +3702,12 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
     {
         LONG *futex = &entry->futex;
         ULONGLONG end;
+        NTSTATUS status = STATUS_ALERTED;
         int ret;
+#if defined(__SWITCH__) && defined(__aarch64__)
+        struct context_data park_contexts[2];
+        int parked = 0;
+#endif
 
         if (timeout)
         {
@@ -3714,6 +3719,20 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
         while (!InterlockedExchange( futex, 0 ))
         {
+#if defined(__SWITCH__) && defined(__aarch64__)
+            /* The futex never reaches the server, so a suspender reading this
+             * thread's registers (the Mono GC stopping the world) would wait
+             * forever for a server call: publish them before blocking. */
+            if (!parked && &horizon_thread_park && &horizon_capture_wait_contexts)
+            {
+                horizon_capture_wait_contexts( park_contexts );
+                if (park_contexts[0].machine)
+                {
+                    horizon_thread_park( get_thread_data()->tid, park_contexts, 1 );
+                    parked = 1;
+                }
+            }
+#endif
             if (timeout)
             {
                 LONGLONG timeleft = update_timeout( end );
@@ -3726,9 +3745,18 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             else
                 ret = futex_wait( futex, 0, NULL );
 
-            if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
+            if (ret == -1 && errno == ETIMEDOUT)
+            {
+                status = STATUS_TIMEOUT;
+                break;
+            }
         }
-        return STATUS_ALERTED;
+#if defined(__SWITCH__) && defined(__aarch64__)
+        /* Suspended while parked: stay stopped, in the server, until resumed. */
+        if (parked && horizon_thread_park( get_thread_data()->tid, NULL, 0 ))
+            server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, park_contexts, NULL );
+#endif
+        return status;
     }
 #elif defined(HAVE_KQUEUE)
     {
